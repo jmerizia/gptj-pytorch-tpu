@@ -7,5 +7,5 @@ setup(name='gptj_colab',
       description='GPT-J for Colab Notebooks',
       author='Jacob Merizian',
       url='https://github.com/jmerizia/gptj_colab',
-      packages=[],
+      py_modules=["gptj_colab"]
      )
