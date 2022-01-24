@@ -557,11 +557,15 @@ class GPTJModel(GPTJPreTrainedModel):
             self.wte = self.wte.to(device)
             token_type_embeds = self.wte(token_type_ids)
             self.wte = self.wte.cpu()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             hidden_states = hidden_states + token_type_embeds
 
         self.drop = self.drop.to(device)
         hidden_states = self.drop(hidden_states)
         self.drop = self.drop.cpu()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         output_shape = input_shape + (hidden_states.size(-1),)
 
@@ -606,6 +610,8 @@ class GPTJModel(GPTJPreTrainedModel):
                     output_attentions=output_attentions,
                 )
                 block = block.cpu()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
             hidden_states = outputs[0]
             if use_cache is True:
@@ -617,6 +623,8 @@ class GPTJModel(GPTJPreTrainedModel):
         self.ln_f = self.ln_f.to(device)
         hidden_states = self.ln_f(hidden_states)
         self.ln_f = self.ln_f.cpu()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
