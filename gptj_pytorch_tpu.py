@@ -24,6 +24,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch_xla.core.xla_model as xm
 
 from transformers.activations import ACT2FN
 from transformers.file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
@@ -35,6 +36,7 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from transformers.models.gptj.configuration_gptj import GPTJConfig
 
 
@@ -49,6 +51,9 @@ GPTJ_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all GPT-J models at https://huggingface.co/models?filter=gptj
 ]
 
+
+def tpu_device_count():
+    return len(xm.get_xla_supported_devices())
 
 def fixed_pos_embedding(x, seq_dim=1, seq_len=None):
     dim = x.shape[-1]
@@ -445,6 +450,9 @@ class GPTJModel(GPTJPreTrainedModel):
         self.h = nn.ModuleList([GPTJBlock(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -452,11 +460,33 @@ class GPTJModel(GPTJPreTrainedModel):
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
-        raise ValueError('parallelize() should not be used on Colab GPT-J. Automatic device discovery will be used instead')
+        # Check validity of device_map
+        self.device_map = (
+            get_device_map(len(self.h), range(tpu_device_count())) if device_map is None else device_map
+        )
+        assert_device_map(self.device_map, len(self.h))
+        self.model_parallel = True
+        self.first_device = "cpu" if "cpu" in self.device_map.keys() else "xla:" + str(min(self.device_map.keys()))
+        self.last_device = "xla:" + str(max(self.device_map.keys()))
+        self.wte = self.wte.to(self.first_device)
+        # Load onto devices
+        for k, v in self.device_map.items():
+            for block in v:
+                device = "xla:" + str(k)
+                self.h[block] = self.h[block].to(device)
+        # ln_f to last
+        self.ln_f = self.ln_f.to(self.last_device)
 
     @add_start_docstrings(DEPARALLELIZE_DOCSTRING)
     def deparallelize(self):
-        raise ValueError('deparallelize() should not be used on Colab GPT-J. Automatic device discovery will be used instead')
+        self.model_parallel = False
+        self.device_map = None
+        self.first_device = "cpu"
+        self.last_device = "cpu"
+        self.wte = self.wte.to("cpu")
+        for index in range(len(self.h)):
+            self.h[index] = self.h[index].to("cpu")
+        self.ln_f = self.ln_f.to("cpu")
 
     def get_input_embeddings(self):
         return self.wte
@@ -546,7 +576,6 @@ class GPTJModel(GPTJPreTrainedModel):
         # attention_probs has shape bsz x num_attention_heads x N x N
         # head_mask has shape n_layer x batch x num_attention_heads x N x N
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
-        head_mask = head_mask.to(device)
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -554,18 +583,10 @@ class GPTJModel(GPTJPreTrainedModel):
         hidden_states = inputs_embeds
 
         if token_type_ids is not None:
-            self.wte = self.wte.to(device)
             token_type_embeds = self.wte(token_type_ids)
-            self.wte = self.wte.cpu()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
             hidden_states = hidden_states + token_type_embeds
 
-        self.drop = self.drop.to(device)
         hidden_states = self.drop(hidden_states)
-        self.drop = self.drop.cpu()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
         output_shape = input_shape + (hidden_states.size(-1),)
 
@@ -574,6 +595,16 @@ class GPTJModel(GPTJPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
 
+            # Model parallel
+            if self.model_parallel:
+                # Ensure layer_past is on same device as hidden_states (might not be correct)
+                if layer_past is not None:
+                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
+                # Ensure that attention_mask is always on the same device as hidden_states
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(hidden_states.device)
+                if isinstance(head_mask, torch.Tensor):
+                    head_mask = head_mask.to(hidden_states.device)
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -600,7 +631,6 @@ class GPTJModel(GPTJPreTrainedModel):
                     head_mask[i],
                 )
             else:
-                block = block.to(torch.device(device))
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
@@ -609,9 +639,6 @@ class GPTJModel(GPTJPreTrainedModel):
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
-                block = block.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
 
             hidden_states = outputs[0]
             if use_cache is True:
@@ -620,11 +647,13 @@ class GPTJModel(GPTJPreTrainedModel):
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
-        self.ln_f = self.ln_f.to(device)
+            # Model Parallel: If it's the last layer for that device, put things on the next device
+            if self.model_parallel:
+                for k, v in self.device_map.items():
+                    if i == v[-1] and "xla:" + str(k) != self.last_device:
+                        hidden_states = hidden_states.to("xla:" + str(k + 1))
+
         hidden_states = self.ln_f(hidden_states)
-        self.ln_f = self.ln_f.cpu()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
@@ -657,16 +686,31 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
         self.transformer = GPTJModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
 
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
-        raise ValueError('parallelize() should not be used on Colab GPT-J. Automatic device discovery will be used instead')
+        self.device_map = (
+            get_device_map(len(self.transformer.h), range(tpu_device_count()))
+            if device_map is None
+            else device_map
+        )
+        assert_device_map(self.device_map, len(self.transformer.h))
+        self.transformer.parallelize(self.device_map)
+        self.lm_head = self.lm_head.to(self.transformer.first_device)
+        self.model_parallel = True
 
     @add_start_docstrings(DEPARALLELIZE_DOCSTRING)
     def deparallelize(self):
-        raise ValueError('deparallelize() should not be used on Colab GPT-J. Automatic device discovery will be used instead')
+        self.transformer.deparallelize()
+        self.transformer = self.transformer.to("cpu")
+        self.lm_head = self.lm_head.to("cpu")
+        self.model_parallel = False
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -747,6 +791,10 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
         )
         hidden_states = transformer_outputs[0]
 
+        # Set device for model parallelism
+        if self.model_parallel:
+            hidden_states = hidden_states.to(self.lm_head.weight.device)
+
         # make sure sampling in fp16 works correctly and
         # compute loss in fp32 to match with mesh-tf version
         # https://github.com/EleutherAI/gpt-neo/blob/89ce74164da2fb16179106f54e2269b5da8db333/models/gpt2/gpt2.py#L179
@@ -809,6 +857,10 @@ class GPTJForSequenceClassification(GPTJPreTrainedModel):
         self.num_labels = config.num_labels
         self.transformer = GPTJModel(config)
         self.score = nn.Linear(config.n_embd, self.num_labels, bias=False)
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -931,6 +983,10 @@ class GPTJForQuestionAnswering(GPTJPreTrainedModel):
         self.num_labels = config.num_labels
         self.transformer = GPTJModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
 
         # Initialize weights and apply final processing
         self.post_init()
